@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Gargantua</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #000;
+    cursor: none;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+const canvas = document.getElementById('canvas');
+const gl = canvas.getContext('webgl', { antialias: false });
+
+if (!gl) {
+  document.body.innerHTML = '<h1 style="color:white">WebGL not supported.</h1>';
+  throw new Error('No WebGL');
+}
+
+const halfFloatExt = gl.getExtension('OES_texture_half_float');
+const halfFloatLinear = gl.getExtension('OES_texture_half_float_linear');
+const TEX_TYPE = halfFloatExt ? halfFloatExt.HALF_FLOAT_OES : gl.UNSIGNED_BYTE;
+const TEX_FILTER = halfFloatLinear ? gl.LINEAR : (halfFloatExt ? gl.NEAREST : gl.LINEAR);
+
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+let W = Math.floor(window.innerWidth * DPR);
+let H = Math.floor(window.innerHeight * DPR);
+
+function resize() {
+  W = Math.floor(window.innerWidth * DPR);
+  H = Math.floor(window.innerHeight * DPR);
+  canvas.width = W;
+  canvas.height = H;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  createFBOs();
+}
+
+const vsSource = `
+attribute vec2 aPosition;
+varying vec2 vUV;
+void main() {
+  vUV = aPosition * 0.5 + 0.5;
+  gl_Position = vec4(aPosition, 0.0, 1.0);
+}
+`;
+
+const sceneFS = `
+precision highp float;
+varying vec2 vUV;
+uniform vec2 uResolution;
+uniform float uTime;
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+float hash3(vec3 p) {
+  return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
+}
+float noise3(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash3(i);
+  float b = hash3(i + vec3(1.0, 0.0, 0.0));
+  float c = hash3(i + vec3(0.0, 1.0, 0.0));
+  float d = hash3(i + vec3(1.0, 1.0, 0.0));
+  float e = hash3(i + vec3(0.0, 0.0, 1.0));
+  float f1 = hash3(i + vec3(1.0, 0.0, 1.0));
+  float g = hash3(i + vec3(0.0, 1.0, 1.0));
+  float h = hash3(i + vec3(1.0, 1.0, 1.0));
+  return mix(
+    mix(mix(a, b, f.x), mix(c, d, f.x), f.y),
+    mix(mix(e, f1, f.x), mix(g, h, f.x), f.y),
+    f.z
+  );
+}
+
+float fbm(vec3 p) {
+  float v = 0.0; float amp = 0.5;
+  for (int i = 0; i < 6; i++) { v += amp * noise3(p); p *= 2.13; amp *= 0.5; }
+  return v;
+}
+
+float ridge(vec3 p) {
+  float n = noise3(p);
+  return 1.0 - abs(n * 2.0 - 1.0);
+}
+
+float ridgedFbm(vec3 p) {
+  float v = 0.0; float amp = 0.5;
+  for (int i = 0; i < 5; i++) { v += amp * ridge(p); p *= 2.13; amp *= 0.5; }
+  return v;
+}
+
+float warpedFbm(vec3 p) {
+  vec3 q = vec3(fbm(p), fbm(p + vec3(5.2, 1.3, 0.0)), fbm(p + vec3(0.0, 5.2, 1.3)));
+  return fbm(p + 4.0 * q);
+}
+
+vec3 starField(vec3 dir) {
+  vec3 col = vec3(0.0);
+  vec2 sph = vec2(atan(dir.z, dir.x), asin(dir.y));
+
+  // Layer A: very dense fine background stars
+  {
+    vec2 cell = sph * 500.0;
+    vec2 ci = floor(cell); vec2 cf = fract(cell);
+    float p = hash(ci);
+    if (p > 0.955) {
+      float d = length(cf - 0.5);
+      float bright = 0.8 + hash(ci * 1.7) * 1.0;
+      vec3 tint = mix(vec3(0.9, 0.95, 1.0), vec3(1.0, 0.95, 0.85), hash(ci * 2.3));
+      col += tint * bright * smoothstep(0.12, 0.0, d);
+    }
+  }
+
+  // Layer B: medium-density stars
+  {
+    vec2 cell = sph * 200.0;
+    vec2 ci = floor(cell); vec2 cf = fract(cell);
+    float p = hash(ci + 31.0);
+    if (p > 0.965) {
+      float d = length(cf - 0.5);
+      float bright = 1.5 + hash(ci * 1.3) * 2.0;
+      vec3 tint = mix(vec3(1.0, 0.85, 0.6), vec3(0.65, 0.8, 1.0), hash(ci * 1.9));
+      col += tint * bright * smoothstep(0.14, 0.0, d);
+    }
+  }
+
+  // Layer C: bigger stars with stellar temperature classes
+  {
+    vec2 cell = sph * 75.0;
+    vec2 ci = floor(cell); vec2 cf = fract(cell);
+    float p = hash(ci + 71.0);
+    if (p > 0.978) {
+      float d = length(cf - 0.5);
+      float bright = 2.5 + hash(ci * 0.9) * 3.0;
+      float temp = hash(ci * 1.1);
+      vec3 tint;
+      if (temp < 0.18)      tint = vec3(1.0, 0.5, 0.3);
+      else if (temp < 0.45) tint = vec3(1.0, 0.85, 0.6);
+      else if (temp < 0.78) tint = vec3(1.0, 1.0, 0.95);
+      else                  tint = vec3(0.7, 0.85, 1.0);
+      col += tint * bright * smoothstep(0.16, 0.0, d);
+    }
+  }
+
+  // Layer D: rare bright cinematic stars with diffraction spikes (these bloom)
+  {
+    vec2 cell = sph * 18.0;
+    vec2 ci = floor(cell); vec2 cf = fract(cell);
+    float p = hash(ci + 137.0);
+    if (p > 0.988) {
+      float d = length(cf - 0.5);
+      float bright = 5.0 + hash(ci * 0.7) * 6.0;
+      float temp = hash(ci * 0.8);
+      vec3 tint = temp < 0.4 ? vec3(1.0, 0.7, 0.4)
+                : temp < 0.75 ? vec3(1.0, 0.95, 0.85)
+                : vec3(0.7, 0.85, 1.0);
+      col += tint * bright * smoothstep(0.2, 0.0, d);
+      float cross = max(
+        smoothstep(0.5, 0.0, abs(cf.x - 0.5)) * smoothstep(0.02, 0.0, abs(cf.y - 0.5)),
+        smoothstep(0.5, 0.0, abs(cf.y - 0.5)) * smoothstep(0.02, 0.0, abs(cf.x - 0.5))
+      );
+      col += tint * cross * 2.0;
+    }
+  }
+
+  // Multi-color nebula clouds
+  float neb1 = fbm(dir * 2.0);
+  float neb2 = fbm(dir * 0.8 + 50.0);
+  float nebMask = pow(max(0.0, neb1 - 0.42), 2.0) * 1.5;
+  vec3 nebPurple = vec3(0.4, 0.13, 0.5);
+  vec3 nebBlue   = vec3(0.1, 0.22, 0.55);
+  vec3 nebRed    = vec3(0.55, 0.18, 0.28);
+  vec3 nebColor = mix(nebPurple, nebBlue, neb2);
+  nebColor = mix(nebColor, nebRed, smoothstep(0.55, 0.82, neb2));
+  col += nebColor * nebMask * 0.8;
+
+  // Galactic dust band
+  float band = exp(-abs(dir.y - 0.05) * 4.0) * (0.5 + 0.5 * fbm(dir * 5.0));
+  col += vec3(0.28, 0.2, 0.35) * band * 0.5;
+
+  return col;
+}
+
+const float DISK_INNER = 2.7;
+const float DISK_OUTER = 13.0;
+const float DISK_HEIGHT = 0.28;
+
+float diskDensity(vec3 pos) {
+  float r = length(pos.xz);
+  if (r < DISK_INNER || r > DISK_OUTER) return 0.0;
+  if (abs(pos.y) > DISK_HEIGHT) return 0.0;
+
+  // Sharp vertical Gaussian profile
+  float scaleH = DISK_HEIGHT * (0.2 + 0.6 * (r - DISK_INNER) / (DISK_OUTER - DISK_INNER));
+  float heightFalloff = exp(-(pos.y * pos.y) / (scaleH * scaleH * 0.5));
+
+  // Radial fade
+  float radial = smoothstep(DISK_INNER, DISK_INNER + 0.25, r) *
+                 (1.0 - smoothstep(DISK_OUTER - 3.0, DISK_OUTER, r));
+
+  // Keplerian rotation
+  float angle = atan(pos.z, pos.x);
+  float orbitSpeed = 2.0 / sqrt(r);
+  float rotAngle = angle + uTime * orbitSpeed;
+
+  // Polar-rotating noise coords
+  vec3 nP = vec3(cos(rotAngle) * r, pos.y * 6.0, sin(rotAngle) * r);
+
+  // Spiral arm density waves
+  float spiralPhase = angle * 3.0 - log(r) * 4.0;
+  float spiral = sin(spiralPhase);
+  spiral = pow(max(0.0, spiral) * 0.5 + 0.5, 2.5);
+
+  // Multi-layer turbulence
+  float turb = warpedFbm(nP * 0.5);
+  float filaments = pow(ridgedFbm(nP * 1.5 + vec3(uTime * 0.2)), 1.4);
+  float fineDetail = fbm(nP * 4.0 + vec3(uTime * 0.4));
+
+  float d = heightFalloff * radial;
+  d *= smoothstep(0.1, 0.55, turb);
+  d *= 0.3 + spiral * 1.3;
+  d *= 0.4 + filaments * 1.1;
+  d *= 0.6 + fineDetail * 0.5;
+
+  return max(0.0, d) * 8.0;
+}
+
+vec3 diskEmission(vec3 pos, vec3 cameraPos) {
+  float r = length(pos.xz);
+  float angle = atan(pos.z, pos.x);
+  float normalized = clamp((r - DISK_INNER) / (DISK_OUTER - DISK_INNER), 0.0, 1.0);
+
+  // Interstellar orange/gold palette
+  vec3 whiteHot = vec3(1.0, 0.98, 0.92);
+  vec3 gold     = vec3(1.0, 0.78, 0.45);
+  vec3 orange   = vec3(1.0, 0.5, 0.15);
+  vec3 deepRed  = vec3(0.7, 0.18, 0.04);
+
+  vec3 baseColor;
+  if (normalized < 0.2) baseColor = mix(whiteHot, gold, normalized / 0.2);
+  else if (normalized < 0.6) baseColor = mix(gold, orange, (normalized - 0.2) / 0.4);
+  else baseColor = mix(orange, deepRed, (normalized - 0.6) / 0.4);
+
+  // Doppler beaming
+  vec3 motion = vec3(-sin(angle), 0.0, cos(angle));
+  float doppler = dot(motion, normalize(cameraPos - pos));
+  if (doppler > 0.0) {
+    baseColor = mix(baseColor, baseColor * vec3(0.85, 1.05, 1.3), doppler * 0.6);
+    baseColor *= 1.0 + doppler * doppler * 3.0;
+  } else {
+    baseColor *= 1.0 / (1.0 - doppler * 1.5);
+    baseColor = mix(baseColor, baseColor * vec3(1.4, 0.7, 0.4), -doppler * 0.5);
+  }
+
+  // Gravitational redshift
+  float redshift = pow(clamp(1.0 - 1.0 / r, 0.0, 1.0), 0.5);
+  baseColor *= mix(0.4, 1.0, redshift);
+
+  // Inner edge brightness
+  float innerGlow = pow(1.0 - normalized, 1.2) * 2.5 + 0.8;
+  return baseColor * innerGlow;
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uResolution.xy) / uResolution.y;
+
+  // Camera — fixed cinematic angle
+  float camAngle = 0.0;
+  float camHeight = 0.9;
+  float camDist = 22.0;
+  vec3 cameraPos = vec3(sin(camAngle) * camDist, camHeight, -cos(camAngle) * camDist);
+  vec3 forward = -normalize(cameraPos);
+  vec3 right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
+  vec3 up = cross(right, forward);
+  vec3 rayDir = normalize(uv.x * right + uv.y * up + 1.0 * forward);
+
+  float eventHorizon = 1.0;
+
+  vec3 pos = cameraPos;
+  vec3 dir = rayDir;
+  vec3 accumColor = vec3(0.0);
+  float accumAlpha = 0.0;
+  float minR = 999.0;
+  bool eaten = false;
+
+  for (int i = 0; i < 500; i++) {
+    float r = length(pos);
+    minR = min(minR, r);
+    if (r < eventHorizon) { eaten = true; break; }
+
+    vec3 toCenter = -pos / r;
+    float gravStrength = 2.0 / (r * r);
+    dir = normalize(dir + toCenter * gravStrength * 0.07);
+
+    float stepSize = max(0.025, r * 0.04);
+    if (abs(pos.y) < DISK_HEIGHT * 1.5 && length(pos.xz) < DISK_OUTER + 1.0) {
+      stepSize *= 0.4;
+    }
+    if (r < 4.0) stepSize *= 0.4;
+
+    float density = diskDensity(pos);
+    if (density > 0.0) {
+      vec3 emission = diskEmission(pos, cameraPos);
+      float a = clamp(density * stepSize, 0.0, 1.0);
+      accumColor += (1.0 - accumAlpha) * emission * a;
+      accumAlpha += (1.0 - accumAlpha) * a;
+      if (accumAlpha > 0.99) break;
+    }
+
+    pos += dir * stepSize;
+    if (r > 100.0) break;
+  }
+
+  vec3 bg = eaten ? vec3(0.0) : starField(normalize(dir));
+  vec3 color = accumColor + (1.0 - accumAlpha) * bg;
+
+  // Photon ring
+  if (!eaten && minR < 2.2) {
+    float ringT = max(0.0, 1.0 - (minR - eventHorizon) / 1.0);
+    float ring = pow(ringT, 4.0) * 5.0;
+    color += vec3(1.0, 0.92, 0.78) * ring;
+  }
+
+  gl_FragColor = vec4(color, 1.0);
+}
+`;
+
+const brightFS = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uScene;
+uniform float uThreshold;
+
+void main() {
+  vec3 c = texture2D(uScene, vUV).rgb;
+  float lum = dot(c, vec3(0.299, 0.587, 0.114));
+  float w = smoothstep(uThreshold, uThreshold + 0.5, lum);
+  gl_FragColor = vec4(c * w, 1.0);
+}
+`;
+
+const blurFS = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uDir;
+uniform vec2 uTexel;
+
+void main() {
+  vec3 sum = vec3(0.0);
+  float w[9];
+  w[0]=0.05; w[1]=0.09; w[2]=0.12; w[3]=0.15; w[4]=0.18; w[5]=0.15; w[6]=0.12; w[7]=0.09; w[8]=0.05;
+  for (int i = 0; i < 9; i++) {
+    float offset = float(i) - 4.0;
+    vec2 sampleUV = vUV + uDir * uTexel * offset * 2.5;
+    sum += texture2D(uTex, sampleUV).rgb * w[i];
+  }
+  gl_FragColor = vec4(sum, 1.0);
+}
+`;
+
+const compositeFS = `
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uScene;
+uniform sampler2D uBloom;
+
+vec3 acesToneMap(vec3 x) {
+  float a = 2.51;
+  float b = 0.03;
+  float c = 2.43;
+  float d = 0.59;
+  float e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+  vec3 scene = texture2D(uScene, vUV).rgb;
+  vec3 bloom = texture2D(uBloom, vUV).rgb;
+  vec3 combined = scene + bloom * 0.4;
+  combined = acesToneMap(combined);
+
+  vec2 vc = vUV - 0.5;
+  float vig = 1.0 - dot(vc, vc) * 0.6;
+  combined *= vig;
+
+  combined = pow(combined, vec3(0.92));
+
+  gl_FragColor = vec4(combined, 1.0);
+}
+`;
+
+function compileShader(type, source) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, source);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error('Compile error:', gl.getShaderInfoLog(s));
+    return null;
+  }
+  return s;
+}
+
+function createProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  return p;
+}
+
+const sceneProg = createProgram(vsSource, sceneFS);
+const brightProg = createProgram(vsSource, brightFS);
+const blurProg = createProgram(vsSource, blurFS);
+const compositeProg = createProgram(vsSource, compositeFS);
+
+const quadBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+gl.bufferData(gl.ARRAY_BUFFER,
+  new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]),
+  gl.STATIC_DRAW);
+
+function setupQuad(program) {
+  const loc = gl.getAttribLocation(program, 'aPosition');
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+let sceneFBO, brightFBO, blurHFBO, blurVFBO;
+
+function createFBO(w, h) {
+  const fbo = gl.createFramebuffer();
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, TEX_TYPE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, TEX_FILTER);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, TEX_FILTER);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { fbo, tex, w, h };
+}
+
+function createFBOs() {
+  sceneFBO = createFBO(W, H);
+  const bw = Math.max(1, Math.floor(W / 2));
+  const bh = Math.max(1, Math.floor(H / 2));
+  brightFBO = createFBO(bw, bh);
+  blurHFBO = createFBO(bw, bh);
+  blurVFBO = createFBO(bw, bh);
+}
+
+window.addEventListener('resize', resize);
+canvas.width = W;
+canvas.height = H;
+canvas.style.width = window.innerWidth + 'px';
+canvas.style.height = window.innerHeight + 'px';
+createFBOs();
+
+const startTime = Date.now();
+
+function render() {
+  const time = (Date.now() - startTime) / 1000;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO.fbo);
+  gl.viewport(0, 0, sceneFBO.w, sceneFBO.h);
+  gl.useProgram(sceneProg);
+  setupQuad(sceneProg);
+  gl.uniform2f(gl.getUniformLocation(sceneProg, 'uResolution'), sceneFBO.w, sceneFBO.h);
+  gl.uniform1f(gl.getUniformLocation(sceneProg, 'uTime'), time);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, brightFBO.fbo);
+  gl.viewport(0, 0, brightFBO.w, brightFBO.h);
+  gl.useProgram(brightProg);
+  setupQuad(brightProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, sceneFBO.tex);
+  gl.uniform1i(gl.getUniformLocation(brightProg, 'uScene'), 0);
+  gl.uniform1f(gl.getUniformLocation(brightProg, 'uThreshold'), 2.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, blurHFBO.fbo);
+  gl.viewport(0, 0, blurHFBO.w, blurHFBO.h);
+  gl.useProgram(blurProg);
+  setupQuad(blurProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, brightFBO.tex);
+  gl.uniform1i(gl.getUniformLocation(blurProg, 'uTex'), 0);
+  gl.uniform2f(gl.getUniformLocation(blurProg, 'uDir'), 1.0, 0.0);
+  gl.uniform2f(gl.getUniformLocation(blurProg, 'uTexel'), 1.0 / brightFBO.w, 1.0 / brightFBO.h);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, blurVFBO.fbo);
+  gl.viewport(0, 0, blurVFBO.w, blurVFBO.h);
+  gl.useProgram(blurProg);
+  setupQuad(blurProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, blurHFBO.tex);
+  gl.uniform1i(gl.getUniformLocation(blurProg, 'uTex'), 0);
+  gl.uniform2f(gl.getUniformLocation(blurProg, 'uDir'), 0.0, 1.0);
+  gl.uniform2f(gl.getUniformLocation(blurProg, 'uTexel'), 1.0 / blurVFBO.w, 1.0 / blurVFBO.h);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(compositeProg);
+  setupQuad(compositeProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, sceneFBO.tex);
+  gl.uniform1i(gl.getUniformLocation(compositeProg, 'uScene'), 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, blurVFBO.tex);
+  gl.uniform1i(gl.getUniformLocation(compositeProg, 'uBloom'), 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  requestAnimationFrame(render);
+}
+
+// Secret triple-X escape
+let xCount = 0, lastX = 0;
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'x' || e.key === 'X') {
+    const now = Date.now();
+    if (now - lastX < 1000) {
+      xCount++;
+      if (xCount >= 3) { window.close(); window.location.href = 'about:blank'; }
+    } else { xCount = 1; }
+    lastX = now;
+  }
+});
+
+render();
+</script>
+</body>
+</html>
